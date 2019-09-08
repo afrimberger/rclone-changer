@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.5
+#!/usr/bin/env python3
 
 import logging
 import argparse
@@ -8,6 +8,7 @@ import os.path
 import os
 import subprocess
 import fcntl
+import json
 
 class Rclone(object):
     """
@@ -18,18 +19,18 @@ class Rclone(object):
     # Default params config
     #=====================================================
     rclone     = '/usr/bin/rclone'
-    config     = '/opt/bacula/etc/rclone.conf'
-    logFile    = '/var/log/rclone.log'
-    logChanger = '/var/log/rclone-changer.log'
-    lockFile   = '/opt/bacula/working/.rclonelock'
-    stateFile  = '/opt/bacula/working/rclone-changer.state'
+    config     = '/etc/bareos/rclone.conf'
+    logFile    = '/var/log/bareos/rclone.log'
+    logChanger = '/var/log/bareos/rclone-changer.log'
+    lockFile   = '/data/backup/bareos/.rclonelock'
+    stateFile  = '/data/backup/bareos/rclone-changer.state'
     slots      = 100
     #=====================================================
 
     options = []
 
     @staticmethod
-    def _exec_(*args):
+    def _exec_raw_(*args) -> subprocess.CompletedProcess:
         """
         Generic call to execute rclone for use internally by the public rclone command subroutines
 
@@ -42,13 +43,29 @@ class Rclone(object):
         logging.debug('Executing: %s %s %s' % (Rclone.rclone, ' '.join(flags),' '.join(args) ))
 
         # Actually call rclone with options, plus the operation specific arguments
-        output = open(os.devnull,'w')
         callList = [ Rclone.rclone ] + flags + __builtins__.list(args)
-        r = subprocess.call(callList, stderr = output, stdout = output)
+        logging.debug('Executing: callList=%s' % callList)
+        out = subprocess.run(args=callList, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if out.returncode != 0:
+            logging.debug('Result: returncode=%s' % out.returncode)
+            logging.error(out.stderr)
+            raise Exception('Rclone command failed.  Check log %s' % Rclone.logFile )
         
+        return out
+
+    @staticmethod
+    def _exec_(*args):
+        """
+        Generic call to execute rclone for use internally by the public rclone command subroutines
+
+        :param args: simple command list to pass to rclone after calculated options
+        :return: True on success.  
+        """
+
+        r = Rclone._exec_raw_(*args)
         # Basic error handling
-        if r != 0:
-            raise Exception('Rclone command failed.  Check log' % Rclone.logFile )
+        if r.returncode != 0:
+            raise Exception('Rclone command failed.  Check log %s' % Rclone.logFile )
         else:
             return True
 
@@ -86,8 +103,12 @@ class Rclone(object):
         :returns: True if the file exists, False if it does not
         """
         try:
-            Rclone._exec_('ls', path)
-        except Exception: 
+            r = Rclone._exec_raw_('lsjson', path)
+            logging.debug('lsjson returned: %s' % r.stdout)
+            files = json.loads(r.stdout)
+            return len(files) > 0
+        except Exception as e: 
+            logging.error(e)
             return False
 
         return True
@@ -183,7 +204,8 @@ def load(opts, state):
     # If the source doesn't exist we create it locally, which is fine.
     else:
         logging.warning("Volume %s didn't exist in %s.  Creating a new file" % (opts.slot, opts.changer))
-        os.unlink(opts.archive)
+        if os.path.exists(opts.archive):
+            os.unlink(opts.archive)
         open(opts.archive,'w').close()
     
     # Update state after rclone command completion
@@ -204,7 +226,7 @@ def unload(opts, state):
             state.loadedSlot = 0
             logging.info("Unloaded volume %s to %s from %s" % (opts.slot, opts.changer, opts.archive))
         except Exception as e:
-            logging.error("Failed to unload volume %s: %s" % (opts.slot, e))
+            logging.error("Failed to unload volume %s: %s" % (opts.slot, e), e)
     # If we're asked to unload a volume that isn't loaded (according to state file) something
     # has gone wrong
     else: 
