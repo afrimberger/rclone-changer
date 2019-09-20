@@ -119,3 +119,57 @@ Director config:
       Volume Retention = 4 weeks
     }
 ```
+
+# Development Notes
+
+Sources
+* https://github.com/bareos/bareos/blob/623a1644e114d8bb9a2c50471f367b6d982b96c9/core/src/stored/record.h
+* http://www.bacula.com/5.1.x-manuals/en/developers/developers/Volume_Label_Format.html
+* https://www.bacula.org/5.1.x-manuals/de/developers/developers/Overall_Storage_Format.html
+
+## Bareos Tape Header Structure
+
+### Block Header
+The format of the Block Header (version 1.27 and later) is:
+
+```
+uint32_t CheckSum;                /* Block check sum */
+uint32_t BlockSize;               /* Block byte size including the header */
+uint32_t BlockNumber;             /* Block number */
+char ID[4] = "BB02";              /* Identification and block level */
+uint32_t VolSessionId;            /* Session Id for Job */
+uint32_t VolSessionTime;          /* Session Time for Job */
+```
+
+### Record Header
+Each binary data record is preceded by a Record Header. The Record Header is fixed length and fixed format, whereas the binary data record is of variable length. The Record Header is written using the Bacula serialization routines and thus is guaranteed to be in machine independent format.
+
+The format of the Record Header (version 1.27 or later) is:
+
+```
+int32_t FileIndex;   /* File index supplied by File daemon */
+int32_t Stream;      /* Stream number supplied by File daemon */
+uint32_t DataSize;   /* size of following data record in bytes */
+```
+
+### Volume Label Format
+
+```
+char Id[32];              /* Bacula 1.0 Immortal\n */
+uint32_t VerNum;          /* Label version number */
+/* VerNum 11 and greater Bacula 1.27 and later */
+btime_t   label_btime;    /* Time/date tape labeled */
+btime_t   write_btime;    /* Time/date tape first written */
+/* The following are 0 in VerNum 11 and greater */
+float64_t write_date;     /* Date this label written */
+float64_t write_time;     /* Time this label written */
+char VolName[128];        /* Volume name */
+char PrevVolName[128];    /* Previous Volume Name */
+char PoolName[128];       /* Pool name */
+char PoolType[128];       /* Pool type */
+char MediaType[128];      /* Type of this media */
+char HostName[128];       /* Host name of writing computer */
+char LabelProg[32];       /* Label program name */
+char ProgVersion[32];     /* Program version */
+char ProgDate[32];        /* Program build date/time */
+```

@@ -10,6 +10,121 @@ import subprocess
 import fcntl
 import json
 
+import ctypes
+import struct
+import datetime
+
+class BlockHeader(ctypes.BigEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ("CheckSum", ctypes.c_uint32),
+        ("BlockSize", ctypes.c_uint32),
+        ('BlockNumber', ctypes.c_uint32),
+        ('ID', ctypes.c_char * 4),
+        ('VolSessionId', ctypes.c_uint32),
+        ('VolSessionTime', ctypes.c_uint32),
+    ]
+
+class RecordHeader(ctypes.BigEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ("FileIndex", ctypes.c_int32),
+        ("Stream", ctypes.c_int32),
+        ('DataSize', ctypes.c_uint32),
+    ]
+
+class BaresVolumeMetadataReader(object):
+
+    @staticmethod    
+    def _readString(f, max_chars=512):
+        chars = b""
+        for n in range(0, max_chars - 1):
+            c = BaresVolumeMetadataReader._readData(f, 'char')
+            if ord(c) == 0:
+                return "".join(str(chars, 'utf-8'))
+            chars += c
+        return chars
+
+    @staticmethod
+    def _readData(f, typeName):
+        typeNames = {
+            'int8'   :'>b', 'uint8'  :'>B',
+            'int16'  :'>h', 'uint16' :'>H',
+            'int32'  :'>i', 'uint32' :'>I',
+            'int64'  :'>q', 'uint64' :'>Q',
+            'float'  :'>f', 'float16' :'>e',
+            'double' :'>d',
+            'char'   :'>c',
+        }
+
+        typeFormat = typeNames[typeName.lower()]
+        typeSize = struct.calcsize(typeFormat)
+        bValue = f.read(typeSize)
+        return struct.unpack(typeFormat, bValue)[0]
+
+    @staticmethod
+    def _readDateTime(f):
+        return datetime.datetime.fromtimestamp(float(BaresVolumeMetadataReader._readData(f, 'double'))).strftime('%Y-%m-%d %H:%M:%S.%f')
+
+    @staticmethod
+    def _ctypes_structure_to_dict(name, structure):
+        ret = dict()
+        for field_name, field_type in structure._fields_:
+            val = getattr(structure, field_name)
+            if isinstance(val, bytes):
+                val = str(val, 'utf-8')
+            ret[field_name] = str(val)
+        return ret
+
+    @staticmethod
+    def _debug_ctypes_structure(name, structure):
+        logging.debug("")
+        logging.debug("== %s ==" % name)
+        for field_name, field_type in structure._fields_:
+            logging.debug(field_name + "=" + str(getattr(structure, field_name)))
+
+    @staticmethod
+    def _debug_dict(name, h):
+        logging.debug("")
+        logging.debug("== %s ==" % name)
+        for field_name, value in h.items():
+            logging.debug(field_name + "=" + str(value))
+
+    @staticmethod
+    def _read_ctype_structure(f, name, struct_class):
+        structure = struct_class.from_buffer_copy(f.read(ctypes.sizeof(struct_class)))
+        struct_dict = BaresVolumeMetadataReader._ctypes_structure_to_dict(name, structure)
+        BaresVolumeMetadataReader._debug_dict(name, struct_dict)
+        return struct_dict
+    
+    @staticmethod
+    def _read_volume_label(f, name):
+        volume_header = dict()
+        volume_header['Id'] = BaresVolumeMetadataReader._readString(f, 32)
+        volume_header['VerNum'] = BaresVolumeMetadataReader._readData(f, 'uint32')
+        volume_header['label_btime'] = BaresVolumeMetadataReader._readDateTime(f)
+        volume_header['write_btime'] = BaresVolumeMetadataReader._readDateTime(f)
+        volume_header['write_date'] = BaresVolumeMetadataReader._readDateTime(f)
+        volume_header['write_time'] = BaresVolumeMetadataReader._readDateTime(f)
+        volume_header['VolName'] = BaresVolumeMetadataReader._readString(f)
+        BaresVolumeMetadataReader._debug_dict("VolumeLabel", volume_header)
+
+        return volume_header
+
+    @staticmethod
+    def readHeader(vol_file):
+        with open(vol_file, "rb") as f:
+            ret = dict()
+            ret['BlockHeader'] = BaresVolumeMetadataReader._read_ctype_structure(f, "BlockHeader", BlockHeader)
+            ret['RecordHeader'] = BaresVolumeMetadataReader._read_ctype_structure(f, "RecordHeader", RecordHeader)
+            ret['VolumeLabel'] = BaresVolumeMetadataReader._read_volume_label(f, "VolumeLabel")
+
+            return ret
+
+    @staticmethod
+    def getVolumeLabel(vol_file):
+        return BaresVolumeMetadataReader.readHeader(vol_file)['VolumeLabel']['VolName']
+
 class Rclone(object):
     """
     Rclone contains logic to convert simple commands to full rclone command line
@@ -24,7 +139,7 @@ class Rclone(object):
     logChanger = '/var/log/bareos/rclone-changer.log'
     lockFile   = '/data/backup/bareos/.rclonelock'
     stateFile  = '/data/backup/bareos/rclone-changer.state'
-    slots      = 100
+    slots      = 200
     #=====================================================
 
     options = []
@@ -39,7 +154,11 @@ class Rclone(object):
         """
 
         # Compile all the option flags (some implied, some passed by the user) into a single list
-        flags = Rclone.options + ['--config=%s' % Rclone.config, '--log-file=%s' % Rclone.logFile, '-q', '-c']
+        # -c / --checksum has a weird behaviour (tested with sftp backend): If source and destination have no matching blocks,
+        # rclone falls back to comparing the size. As pre-labeled volumes have the same size, this leads to volumes being
+        # never copied. Therefore we use ignore-times and size instead. Under some circumstances, more data is copied over
+        # the wire. However, this behaviour is better than introducing weird bugs.
+        flags = Rclone.options + ['--config=%s' % Rclone.config, '--log-file=%s' % Rclone.logFile, '-q', '--ignore-times', '--ignore-size']
         logging.debug('Executing: %s %s %s' % (Rclone.rclone, ' '.join(flags),' '.join(args) ))
 
         # Actually call rclone with options, plus the operation specific arguments
@@ -107,8 +226,8 @@ class Rclone(object):
             logging.debug('lsjson returned: %s' % r.stdout)
             files = json.loads(r.stdout)
             return len(files) > 0
-        except Exception as e: 
-            logging.error(e)
+        except Exception as e:
+            logging.error("lsjson for %s failed: %s" % (path, e))
             return False
 
         return True
@@ -210,6 +329,12 @@ def load(opts, state):
     
     # Update state after rclone command completion
     state.loadedSlot = opts.slot
+    vol_label = BaresVolumeMetadataReader.getVolumeLabel(opts.archive)
+    formatted = format_label(state.loadedSlot)
+    if formatted != vol_label:
+        msg = "Loaded: source=%s,slot=%s,volume_label=%s,formatted=%s but slot and volume label don't match." % (source, state.loadedSlot, vol_label, formatted)
+        logging.error(msg)
+        raise Exception(msg)    
     logging.info("Loaded volume %s into %s from %s" % (opts.slot, opts.archive, opts.changer))
 
 # Unload tape from a given slot
@@ -222,22 +347,32 @@ def unload(opts, state):
     # If the specified volume is loaded, copy it to cloud storage and update state
     if opts.slot == state.loadedSlot:
         try:
+            vol_label = BaresVolumeMetadataReader.getVolumeLabel(opts.archive)
+            if format_label(opts.slot) != vol_label:
+                msg = "Unload: source=%s,slot=%s,volume_label=%s, but slot and volume label don't match." % (source, opts.slot, vol_label)
+                logging.error(msg)
+                raise Exception(msg)
             Rclone.copy(source, destination)
             state.loadedSlot = 0
             logging.info("Unloaded volume %s to %s from %s" % (opts.slot, opts.changer, opts.archive))
         except Exception as e:
-            logging.error("Failed to unload volume %s: %s" % (opts.slot, e), e)
+            msg = "Failed to unload volume %s: %s" % (opts.slot, e)
+            logging.error(msg, e)
+            raise Exception(msg)
     # If we're asked to unload a volume that isn't loaded (according to state file) something
     # has gone wrong
     else: 
         logging.error("Asked to unload volume %s but loaded volume is %s" % (opts.slot, state.loadedSlot))
         raise Exception("Volume %s not loaded" % opts.slot)
 
+def format_label(i):
+    return "VTAPE-{0:04n}".format(int(i))
+
 # List changer slots with implied barcode data
 def list(opts, state):
     logging.info("Listing volumes in %s" % opts.changer)
     for i in range(1, state.slots + 1):
-        print("{0}:VTAPE-{0:04n}".format(i))
+        print("{0}:".format(i) + format_label(i)) 
 
 # Return number of changer slots
 def slots(opts, state):
