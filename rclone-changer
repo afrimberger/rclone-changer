@@ -9,6 +9,7 @@ import os
 import subprocess
 import fcntl
 import json
+import time
 
 import ctypes
 import struct
@@ -158,8 +159,16 @@ class Rclone(object):
         # rclone falls back to comparing the size. As pre-labeled volumes have the same size, this leads to volumes being
         # never copied. Therefore we use ignore-times and size instead. Under some circumstances, more data is copied over
         # the wire. However, this behaviour is better than introducing weird bugs.
-        flags = Rclone.options + ['--config=%s' % Rclone.config, '--log-file=%s' % Rclone.logFile, '-q', '--ignore-times', '--ignore-size']
-        logging.debug('Executing: %s %s %s' % (Rclone.rclone, ' '.join(flags),' '.join(args) ))
+        flags = Rclone.options + [
+            '--config=%s' % Rclone.config, 
+            '--log-file=%s' % Rclone.logFile, 
+            '-q', 
+            '--ignore-times', 
+            '--ignore-size',
+            '--retries', '60',
+            '--retries-sleep', '1s'
+        ]
+        logging.debug('Executing: %s %s %s' % (Rclone.rclone, ' '.join(flags), ' '.join(args) ))
 
         # Actually call rclone with options, plus the operation specific arguments
         callList = [ Rclone.rclone ] + flags + __builtins__.list(args)
@@ -221,16 +230,20 @@ class Rclone(object):
         :param path: The path to test
         :returns: True if the file exists, False if it does not
         """
-        try:
-            r = Rclone._exec_raw_('lsjson', path)
-            logging.debug('lsjson returned: %s' % r.stdout)
-            files = json.loads(r.stdout)
-            return len(files) > 0
-        except Exception as e:
-            logging.error("lsjson for %s failed: %s" % (path, e))
-            return False
-
-        return True
+        # TODO: This logic sucks for the initial run when no files exist yet, 
+        # because it fails and times out.
+        # Maybe it can be dropped, because retry logic is implemented with rclone
+        # parameters
+        for retry in range(0, 30):
+            try:
+                r = Rclone._exec_raw_('lsjson', path)
+                logging.debug('lsjson returned: %s' % r.stdout)
+                files = json.loads(r.stdout)
+                return len(files) > 0
+            except Exception as e:
+                logging.error("lsjson for %s failed: %s. Retry %s" % (path, e, retry))
+                time.sleep(1)
+        return False
 
 class State(object):
     """
@@ -320,6 +333,12 @@ def load(opts, state):
     # Check if the source file exists.  Copy it locally if it does.
     if Rclone.exists(source):
         Rclone.copy(source, destination)
+        vol_label = BaresVolumeMetadataReader.getVolumeLabel(opts.archive)
+        formatted = format_label(opts.slot)
+        if formatted != vol_label:
+            msg = "Loaded: source=%s,slot=%s,volume_label=%s,formatted=%s but slot and volume label don't match." % (source, opts.slot, vol_label, formatted)
+            logging.error(msg)
+            raise Exception(msg)          
     # If the source doesn't exist we create it locally, which is fine.
     else:
         logging.warning("Volume %s didn't exist in %s.  Creating a new file" % (opts.slot, opts.changer))
@@ -328,13 +347,7 @@ def load(opts, state):
         open(opts.archive,'w').close()
     
     # Update state after rclone command completion
-    state.loadedSlot = opts.slot
-    vol_label = BaresVolumeMetadataReader.getVolumeLabel(opts.archive)
-    formatted = format_label(state.loadedSlot)
-    if formatted != vol_label:
-        msg = "Loaded: source=%s,slot=%s,volume_label=%s,formatted=%s but slot and volume label don't match." % (source, state.loadedSlot, vol_label, formatted)
-        logging.error(msg)
-        raise Exception(msg)    
+    state.loadedSlot = opts.slot  
     logging.info("Loaded volume %s into %s from %s" % (opts.slot, opts.archive, opts.changer))
 
 # Unload tape from a given slot
