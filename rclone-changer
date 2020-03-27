@@ -165,8 +165,8 @@ class Rclone(object):
             '-q', 
             '--ignore-times', 
             '--ignore-size',
-            '--retries', '60',
-            '--retries-sleep', '1s'
+            '--retries', '2880',
+            '--retries-sleep', '30s'
         ]
         logging.debug('Executing: %s %s %s' % (Rclone.rclone, ' '.join(flags), ' '.join(args) ))
 
